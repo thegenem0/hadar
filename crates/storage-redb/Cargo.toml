@@ -1,0 +1,23 @@
+[package]
+name    = "storage-redb"
+version = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+
+[features]
+test-util = ["storage-api/test-util"]
+
+[dependencies]
+redb        = { workspace = true }
+storage-api = { workspace = true }
+
+[dev-dependencies]
+storage-api = { workspace = true, features = ["test-util"] }
+
+[[test]]
+name = "contract"
+required-features = ["test-util"]
+
+[lints]
+workspace = true

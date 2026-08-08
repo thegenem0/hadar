@@ -10,7 +10,10 @@ repository   = "https://github.com/thegenem0/hadar"
 
 [workspace.dependencies]
 storage-api = { version = "0.1.0", path = "crates/storage-api" }
+storage-redb = { version = "0.1.0", path = "crates/storage-redb" }
+redb = { version = "4" }
 thiserror = { version = "2", default-features = false, features = ["std"] }
+
 # tracing   = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 
 [workspace.lints.rust]
