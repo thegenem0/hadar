@@ -1,0 +1,19 @@
+[package]
+name    = "mvcc"
+version = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+
+[features]
+test-util = ["storage-api/test-util"]
+
+[dependencies]
+storage-api = { workspace = true }
+thiserror   = { workspace = true }
+
+[dev-dependencies]
+storage-api = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true
