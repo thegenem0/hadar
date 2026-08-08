@@ -9,12 +9,8 @@ license      = "Apache-2.0"
 repository   = "https://github.com/thegenem0/hadar"
 
 [workspace.dependencies]
-# storage-api = { version = "0.1.0", path = "crates/storage-api" }
-
-# External. `default-features = false` is the default posture (§1);
-# opt into features at the point of use.
-
-# thiserror = { version = "2", default-features = false, features = ["std"] }
+storage-api = { version = "0.1.0", path = "crates/storage-api" }
+thiserror = { version = "2", default-features = false, features = ["std"] }
 # tracing   = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 
 [workspace.lints.rust]
