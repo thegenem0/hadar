@@ -11,6 +11,7 @@ repository   = "https://github.com/thegenem0/hadar"
 [workspace.dependencies]
 storage-api = { version = "0.1.0", path = "crates/storage-api" }
 storage-redb = { version = "0.1.0", path = "crates/storage-redb" }
+mvcc = { version = "0.1.0", path = "crates/mvcc" }
 redb = { version = "4" }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 
