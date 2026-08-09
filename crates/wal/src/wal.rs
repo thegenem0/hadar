@@ -8,17 +8,47 @@ use storage_api::StorageEngine;
 
 use crate::{error::Error, record, segment, writer::Writer};
 
+/// Bytes appended between automatic checkpoints.
+///
+/// A checkpoint costs one durable commit of the whole store, and buys the
+/// right to discard every log segment below it.
+///
+/// Measuring the interval in bytes appended rather than on a timer
+/// ties that cost to work actually done.
+/// An idle server never pays it, and a saturated one pays it at a fixed
+/// fraction of what it is already writing.
+///
+/// Two segments' worth, because a checkpoint can only free a segment that has
+/// a successor. At one segment's worth, a checkpoint can land just before a rollover,
+/// find a single segment, and free nothing.
+///
+/// At two there is always a sealed segment behind the active one.
+///
+/// Raising this spends less time checkpointing and leaves a
+/// longer log to replay after a crash, while lowering it does the reverse.
+const CHECKPOINT_INTERVAL: u64 = 2 * segment::SEGMENT_LIMIT;
+
 /// How a log is opened.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
     /// Size at which a segment is closed and a new one started.
     pub segment_limit: u64,
+
+    /// Bytes appended between automatic checkpoints.
+    ///
+    /// Keep this above `segment_limit`, or a checkpoint can arrive while the
+    /// log is a single segment and free nothing.
+    ///
+    /// `u64::MAX` disables automatic checkpoints, leaving compaction
+    /// entirely to [`Wal::checkpoint`].
+    pub checkpoint_interval: u64,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
             segment_limit: segment::SEGMENT_LIMIT,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
         }
     }
 }
@@ -39,7 +69,6 @@ impl Default for Options {
 pub struct Wal<E: StorageEngine> {
     writer: Writer,
     store: Arc<KvStore<E>>,
-    dir: PathBuf,
 }
 
 impl<E: StorageEngine> Wal<E> {
@@ -73,9 +102,13 @@ impl<E: StorageEngine> Wal<E> {
         };
 
         Ok(Self {
-            writer: Writer::start(Arc::clone(&store), dir.clone(), segment),
+            writer: Writer::start(
+                Arc::clone(&store),
+                dir,
+                segment,
+                options.checkpoint_interval,
+            ),
             store,
-            dir,
         })
     }
 
@@ -105,35 +138,15 @@ impl<E: StorageEngine> Wal<E> {
     ///
     /// Returns the number of segments removed.
     ///
-    /// A segment is removed only when the segment after it begins at or below
-    /// the checkpoint, which means every record it holds is already durable in
-    /// the store.
+    /// The work runs on the writer thread, so it cannot overlap a batch being flushed.
+    /// Every write that reached the queue before this call is included.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be flushed or a segment cannot be
     /// removed. Nothing is discarded unless the flush succeeded first.
-    pub fn checkpoint(&mut self) -> Result<usize, Error> {
-        let durable = self
-            .store
-            .checkpoint()
-            .map_err(|e| Error::apply(e.to_string()))?;
-
-        let segments = segment::list(&self.dir)?;
-        let mut removed = 0;
-
-        for pair in segments.windows(2) {
-            let [(_, path), (next_first, _)] = pair else {
-                continue;
-            };
-            if *next_first > durable {
-                break;
-            }
-            segment::remove(path)?;
-            removed += 1;
-        }
-
-        Ok(removed)
+    pub async fn checkpoint(&mut self) -> Result<usize, Error> {
+        self.writer.checkpoint().await
     }
 
     /// Stops accepting writes and finishes those already queued.
@@ -196,4 +209,32 @@ fn recover<E: StorageEngine>(dir: &Path, store: &KvStore<E>) -> Result<Recovered
     }
 
     Ok(Recovered { tail })
+}
+
+/// Flushes the store and removes the segments it has made redundant.
+///
+/// A segment is removed only when the segment after it begins at or below the
+/// checkpoint, which means every record it holds is already durable in the store.
+///
+///The active segment has no successor, so it is never a candidate.
+pub(crate) fn compact<E: StorageEngine>(store: &KvStore<E>, dir: &Path) -> Result<usize, Error> {
+    let durable = store
+        .checkpoint()
+        .map_err(|e| Error::apply(e.to_string()))?;
+
+    let segments = segment::list(dir)?;
+    let mut removed = 0;
+
+    for pair in segments.windows(2) {
+        let [(_, path), (next_first, _)] = pair else {
+            continue;
+        };
+        if *next_first > durable {
+            break;
+        }
+        segment::remove(path)?;
+        removed += 1;
+    }
+
+    Ok(removed)
 }

@@ -4,7 +4,7 @@ use mvcc::{KvStore, Mutation, Revision};
 use storage_api::StorageEngine;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{error::Error, record, segment::Segment};
+use crate::{error::Error, record, segment::Segment, wal::compact};
 
 /// Most writes folded into a single flush.
 ///
@@ -28,6 +28,15 @@ struct Request {
     respond: oneshot::Sender<Result<Vec<Revision>, Error>>,
 }
 
+/// What the writer thread accepts.
+///
+/// Checkpoints travel the same queue as writes so that the two are ordered against
+/// each other by the queue itself, with no lock and no second path to the segment.
+enum Message {
+    Write(Request),
+    Checkpoint(oneshot::Sender<Result<usize, Error>>),
+}
+
 /// Accepts writes and folds concurrent ones into shared flushes.
 ///
 /// The batching buffer belongs to a single writer thread and is reached only
@@ -37,7 +46,7 @@ struct Request {
 /// occupies a runtime worker.
 #[derive(Debug)]
 pub(crate) struct Writer {
-    submit: mpsc::Sender<Request>,
+    submit: mpsc::Sender<Message>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -47,6 +56,7 @@ impl Writer {
         store: std::sync::Arc<KvStore<E>>,
         dir: PathBuf,
         segment: Segment,
+        checkpoint_interval: u64,
     ) -> Self
     where
         E: StorageEngine,
@@ -54,7 +64,7 @@ impl Writer {
         let (submit, queue) = mpsc::channel(QUEUE_DEPTH);
         let thread = std::thread::Builder::new()
             .name("hadar-wal".to_owned())
-            .spawn(move || run(&store, &dir, segment, queue))
+            .spawn(move || run(&store, &dir, segment, queue, checkpoint_interval))
             .ok();
 
         Self { submit, thread }
@@ -71,7 +81,22 @@ impl Writer {
     pub(crate) async fn write(&self, mutations: Vec<Mutation>) -> Result<Vec<Revision>, Error> {
         let (respond, response) = oneshot::channel();
         self.submit
-            .send(Request { mutations, respond })
+            .send(Message::Write(Request { mutations, respond }))
+            .await
+            .map_err(|_| Error::shutdown())?;
+
+        response.await.map_err(|_| Error::shutdown())?
+    }
+
+    /// Flushes the store and discards the log records it no longer needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log has shut down, or if the flush or a removal fails.
+    pub(crate) async fn checkpoint(&self) -> Result<usize, Error> {
+        let (respond, response) = oneshot::channel();
+        self.submit
+            .send(Message::Checkpoint(respond))
             .await
             .map_err(|_| Error::shutdown())?;
 
@@ -102,25 +127,47 @@ fn run<E: StorageEngine>(
     store: &KvStore<E>,
     dir: &std::path::Path,
     mut segment: Segment,
-    mut queue: mpsc::Receiver<Request>,
+    mut queue: mpsc::Receiver<Message>,
+    checkpoint_interval: u64,
 ) {
     let mut batch: Vec<Request> = Vec::with_capacity(MAX_BATCH);
+    let mut requested: Option<oneshot::Sender<Result<usize, Error>>> = None;
+    let mut appended = 0_u64;
 
     // Everything already queued joins this batch and shares its flush.
     // Taking only what is waiting keeps a lone writer from paying for a
     // timeout that no second writer was going to arrive within.
-    while let Some(first) = queue.blocking_recv() {
-        batch.push(first);
+    while let Some(message) = queue.blocking_recv() {
+        match message {
+            Message::Write(request) => batch.push(request),
+            Message::Checkpoint(respond) => requested = Some(respond),
+        }
 
         while batch.len() < MAX_BATCH {
             match queue.try_recv() {
-                Ok(request) => batch.push(request),
+                Ok(Message::Write(request)) => batch.push(request),
+                Ok(Message::Checkpoint(respond)) => requested = Some(respond),
                 Err(_) => break,
             }
         }
 
-        let outcome = retire(store, dir, &mut segment, &batch);
-        answer(&mut batch, outcome);
+        if !batch.is_empty() {
+            let outcome = retire(store, dir, &mut segment, &batch, &mut appended);
+            answer(&mut batch, outcome);
+        }
+
+        if let Some(respond) = requested.take() {
+            let outcome = compact(store, dir);
+            if outcome.is_ok() {
+                appended = 0;
+            }
+            drop(respond.send(outcome));
+        } else if appended >= checkpoint_interval {
+            match compact(store, dir) {
+                Ok(_) => appended = 0,
+                Err(error) => tracing::warn!(%error, "automatic checkpoint failed"),
+            }
+        }
     }
 }
 
@@ -130,6 +177,7 @@ fn retire<E: StorageEngine>(
     dir: &std::path::Path,
     segment: &mut Segment,
     batch: &[Request],
+    appended: &mut u64,
 ) -> Result<Vec<Revision>, Error> {
     let mut bytes = Vec::new();
     let mut mutations = Vec::new();
@@ -146,6 +194,7 @@ fn retire<E: StorageEngine>(
         *segment = Segment::create(dir, store.applied(), segment.limit())?;
     }
     segment.append(&bytes)?;
+    *appended += bytes.len() as u64;
 
     // Only now is the batch durable, so only now may it become visible.
     // The applied position advances past every record written so far,

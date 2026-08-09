@@ -15,6 +15,48 @@ use wal::{Options, Wal};
 /// and compaction are exercised by tests rather than only by production load.
 const TINY_SEGMENT: u64 = 64;
 
+/// Rolls over constantly, and never checkpoints unless a test asks it to.
+fn tiny() -> Options {
+    Options {
+        segment_limit: TINY_SEGMENT,
+        ..Options::default()
+    }
+}
+
+enum LogDir {
+    Discarded(tempfile::TempDir),
+    Kept(std::path::PathBuf),
+}
+
+impl LogDir {
+    fn new() -> Self {
+        if std::env::var_os("HADAR_KEEP_WAL").is_none() {
+            return Self::Discarded(tempfile::tempdir().expect("temp dir"));
+        }
+
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("unnamed")
+            .replace("::", "-");
+        let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+
+        // Start clean, or a previous run's segments would be replayed as if
+        // they were this one's.
+        drop(std::fs::remove_dir_all(&path));
+        std::fs::create_dir_all(&path).expect("log directory is creatable");
+        println!("log kept at {}", path.display());
+
+        Self::Kept(path)
+    }
+
+    fn path(&self) -> &Path {
+        match self {
+            Self::Discarded(dir) => dir.path(),
+            Self::Kept(path) => path,
+        }
+    }
+}
+
 fn put(key: &[u8], value: &[u8]) -> Mutation {
     Mutation::Put {
         key: key.to_vec(),
@@ -53,11 +95,9 @@ async fn fill(log: &Wal<MemEngine>, count: u32) {
 
 #[tokio::test]
 async fn writing_past_the_limit_rolls_over_to_a_new_segment() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = LogDir::new();
     let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
-    let options = Options {
-        segment_limit: TINY_SEGMENT,
-    };
+    let options = tiny();
     let log = Wal::with_options(dir.path(), Arc::clone(&store), options).expect("log opens");
 
     fill(&log, 20).await;
@@ -71,10 +111,8 @@ async fn writing_past_the_limit_rolls_over_to_a_new_segment() {
 
 #[tokio::test]
 async fn a_rolled_over_log_still_replays_completely() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let options = Options {
-        segment_limit: TINY_SEGMENT,
-    };
+    let dir = LogDir::new();
+    let options = tiny();
 
     {
         let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
@@ -93,17 +131,16 @@ async fn a_rolled_over_log_still_replays_completely() {
 
 #[tokio::test]
 async fn checkpointing_removes_only_fully_durable_segments() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = LogDir::new();
     let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
-    let options = Options {
-        segment_limit: TINY_SEGMENT,
-    };
+    let options = tiny();
+
     let mut log = Wal::with_options(dir.path(), Arc::clone(&store), options).expect("log opens");
 
     fill(&log, 20).await;
     let before = segments(dir.path());
 
-    let removed = log.checkpoint().expect("checkpoint succeeds");
+    let removed = log.checkpoint().await.expect("checkpoint succeeds");
 
     assert!(removed > 0, "checkpoint freed nothing from {before:?}");
     assert_eq!(
@@ -121,15 +158,14 @@ async fn checkpointing_removes_only_fully_durable_segments() {
 
 #[tokio::test]
 async fn data_survives_a_checkpoint_that_discarded_its_records() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = LogDir::new();
     let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
-    let options = Options {
-        segment_limit: TINY_SEGMENT,
-    };
+    let options = tiny();
+
     let mut log = Wal::with_options(dir.path(), Arc::clone(&store), options).expect("log opens");
 
     fill(&log, 20).await;
-    log.checkpoint().expect("checkpoint succeeds");
+    log.checkpoint().await.expect("checkpoint succeeds");
 
     // Writing after a checkpoint has to keep working, and the records written
     // before it must remain readable even though their log entries are gone.
@@ -143,17 +179,16 @@ async fn data_survives_a_checkpoint_that_discarded_its_records() {
 
 #[tokio::test]
 async fn recovery_after_a_checkpoint_does_not_recount_from_zero() {
-    let dir = tempfile::tempdir().expect("temp dir");
-    let options = Options {
-        segment_limit: TINY_SEGMENT,
-    };
+    let dir = LogDir::new();
+    let options = tiny();
+
     let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
 
     {
         let mut log =
             Wal::with_options(dir.path(), Arc::clone(&store), options).expect("log opens");
         fill(&log, 20).await;
-        log.checkpoint().expect("checkpoint succeeds");
+        log.checkpoint().await.expect("checkpoint succeeds");
         log.write(vec![put(b"after", b"v")])
             .await
             .expect("write succeeds");
@@ -170,4 +205,53 @@ async fn recovery_after_a_checkpoint_does_not_recount_from_zero() {
         21,
         "recovery replayed records the store had already applied"
     );
+}
+
+#[tokio::test]
+async fn the_log_checkpoints_itself_without_being_asked() {
+    let dir = LogDir::new();
+    let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
+    let options = Options {
+        segment_limit: TINY_SEGMENT,
+        // Two segments' worth, so every checkpoint finds a sealed segment
+        // behind the active one.
+        checkpoint_interval: TINY_SEGMENT * 2,
+    };
+    let log = Wal::with_options(dir.path(), Arc::clone(&store), options).expect("log opens");
+
+    fill(&log, 200).await;
+
+    // Left alone, this burst rolls over roughly fifty times.
+    // Nothing here calls checkpoint, so a log that stays small
+    // proves the writer is compacting on its own.
+    assert!(
+        segments(dir.path()).len() < 8,
+        "the log grew unbounded: {:?}",
+        segments(dir.path())
+    );
+    assert_eq!(store.current_revision().main(), 200);
+}
+
+#[tokio::test]
+async fn records_survive_the_log_checkpointing_itself() {
+    let dir = LogDir::new();
+    let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
+    let options = Options {
+        segment_limit: TINY_SEGMENT,
+        checkpoint_interval: TINY_SEGMENT * 2,
+    };
+
+    {
+        let log = Wal::with_options(dir.path(), Arc::clone(&store), options).expect("log opens");
+        fill(&log, 200).await;
+    }
+
+    // Most of these records no longer exist in the log at all.
+    // They are readable because the checkpoint that discarded them
+    // flushed the store first.
+    let reopened = Wal::with_options(dir.path(), Arc::clone(&store), options);
+    assert!(reopened.is_ok(), "reopen failed after self-compaction");
+
+    assert_eq!(store.current_revision().main(), 200);
+    assert_eq!(values(&store).len(), 200);
 }

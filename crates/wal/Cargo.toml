@@ -11,6 +11,7 @@ mvcc = { workspace = true }
 storage-api = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
