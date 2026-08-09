@@ -23,7 +23,6 @@ use crate::{Bounds, ReadTxn, StorageEngine, WriteTxn};
 /// ```ignore
 /// storage_api::conformance_suite!(storage_redb::RedbEngine::temporary);
 /// ```
-
 #[macro_export]
 macro_rules! conformance_suite {
     ($new_engine:expr) => {

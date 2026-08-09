@@ -130,6 +130,27 @@ pub trait WriteTxn: ReadTxn {
     /// Returns an error if the commit fails, in which case none of the writes are applied.
     fn commit(self) -> Result<(), Error>;
 
+    /// Applies every buffered write atomically and waits for it to reach
+    /// stable storage.
+    ///
+    /// This is [`commit`](Self::commit) plus the durability that it does not guarantee.
+    /// When this returns `Ok`, the writes have survived leaving the process,
+    /// and a power loss will not take them back.
+    ///
+    /// It is a separate method as the two have different costs by an order of magnitude,
+    /// and the choice belongs at the call site where the reason for it is visible.
+    ///
+    /// Expected to be called rarely.
+    /// A log above this layer normally provides durability far more cheaply by batching,
+    /// and calls it here only to establish a point past which the log can be discarded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the commit or the flush fails.
+    /// The writes must be treated as not durable, whether they are visible is
+    /// unspecified, so a caller that needs to know must re-read.
+    fn commit_durable(self) -> Result<(), Error>;
+
     /// Discards every buffered write and releases the writer slot.
     ///
     /// # Errors

@@ -1,4 +1,6 @@
-use redb::{CommitError, DatabaseError, StorageError, TableError, TransactionError};
+use redb::{
+    CommitError, DatabaseError, SetDurabilityError, StorageError, TableError, TransactionError,
+};
 use storage_api::Error;
 
 pub(crate) fn storage(context: &'static str, source: StorageError) -> Error {
@@ -39,4 +41,8 @@ pub(crate) fn commit(context: &'static str, source: CommitError) -> Error {
         CommitError::Storage(inner) => storage(context, inner),
         other => Error::other(context).with_source(other),
     }
+}
+
+pub(crate) fn durability(context: &'static str, source: SetDurabilityError) -> Error {
+    Error::other(context).with_source(source)
 }

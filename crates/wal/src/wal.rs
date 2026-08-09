@@ -1,0 +1,285 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+
+use mvcc::{KvStore, Mutation, Revision};
+use storage_api::StorageEngine;
+
+use crate::{error::Error, io::Media, record, segment, writer::Writer};
+
+/// Bytes appended between automatic checkpoints.
+///
+/// A checkpoint costs one durable commit of the whole store, and buys the
+/// right to discard every log segment below it.
+///
+/// Measuring the interval in bytes appended rather than on a timer
+/// ties that cost to work actually done.
+/// An idle server never pays it, and a saturated one pays it at a fixed
+/// fraction of what it is already writing.
+///
+/// Two segments' worth, because a checkpoint can only free a segment that has
+/// a successor. At one segment's worth, a checkpoint can land just before a rollover,
+/// find a single segment, and free nothing.
+///
+/// At two there is always a sealed segment behind the active one.
+///
+/// Raising this spends less time checkpointing and leaves a
+/// longer log to replay after a crash, while lowering it does the reverse.
+const CHECKPOINT_INTERVAL: u64 = 2 * segment::SEGMENT_LIMIT;
+
+/// How a log is opened.
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    /// Size at which a segment is closed and a new one started.
+    pub segment_limit: u64,
+
+    /// Bytes appended between automatic checkpoints.
+    ///
+    /// Keep this above `segment_limit`, or a checkpoint can arrive while the
+    /// log is a single segment and free nothing.
+    ///
+    /// `u64::MAX` disables automatic checkpoints, leaving compaction
+    /// entirely to [`Wal::checkpoint`].
+    pub checkpoint_interval: u64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            segment_limit: segment::SEGMENT_LIMIT,
+            checkpoint_interval: CHECKPOINT_INTERVAL,
+        }
+    }
+}
+
+/// A durable write-ahead log fronting a revision-indexed store.
+///
+/// Writes are recorded here and flushed before they are applied, so an
+/// acknowledged write survives a crash and an unacknowledged one is never
+/// visible afterwards. Concurrent writes share a flush, which is what makes
+/// durability affordable.
+///
+/// # Recovery
+///
+/// Opening replays whatever the store has not yet applied. The store records
+/// how far it has applied in the same transaction as the data, so the two
+/// cannot disagree, and replays from that point exactly.
+#[derive(Debug)]
+pub struct Wal<E: StorageEngine> {
+    writer: Writer,
+    store: Arc<KvStore<E>>,
+}
+
+impl<E: StorageEngine> Wal<E> {
+    /// Opens the log in `dir`, replaying anything `store` has not applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be read, a segment is damaged,
+    /// or replaying its records into the store fails.
+    pub fn open(dir: impl Into<PathBuf>, store: Arc<KvStore<E>>) -> Result<Self, Error> {
+        Self::with_options(dir, store, Options::default())
+    }
+
+    /// Opens the log with explicit options.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    pub fn with_options(
+        dir: impl Into<PathBuf>,
+        store: Arc<KvStore<E>>,
+        options: Options,
+    ) -> Result<Self, Error> {
+        Self::open_with(dir, store, options, &Media::Real)
+    }
+
+    /// Opens the log with faults injected into its I/O.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    #[cfg(feature = "test-util")]
+    pub fn with_faults(
+        dir: impl Into<PathBuf>,
+        store: Arc<KvStore<E>>,
+        options: Options,
+        faults: Arc<crate::Faults>,
+    ) -> Result<Self, Error> {
+        Self::open_with(dir, store, options, &Media::Faulty(faults))
+    }
+
+    fn open_with(
+        dir: impl Into<PathBuf>,
+        store: Arc<KvStore<E>>,
+        options: Options,
+        media: &Media,
+    ) -> Result<Self, Error> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir).map_err(|e| Error::io("creating the log directory", e))?;
+
+        let recovered = recover(&dir, &store)?;
+        let segment = match recovered.tail {
+            Some(tail) => {
+                segment::Segment::reopen(media, &tail.path, tail.valid, options.segment_limit)?
+            }
+            None => segment::Segment::create(media, &dir, 0, options.segment_limit)?,
+        };
+
+        Ok(Self {
+            writer: Writer::start(
+                Arc::clone(&store),
+                dir,
+                segment,
+                options.checkpoint_interval,
+            ),
+            store,
+        })
+    }
+
+    /// Records `mutations` durably and applies them, returning their revisions.
+    ///
+    /// The call returns once the batch is both flushed and visible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the log cannot be written or the store cannot apply
+    /// the batch. Neither acknowledges the write.
+    pub async fn write(&self, mutations: Vec<Mutation>) -> Result<Vec<Revision>, Error> {
+        if mutations.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.writer.write(mutations).await
+    }
+
+    /// Returns the store this log protects.
+    #[must_use]
+    pub fn store(&self) -> &Arc<KvStore<E>> {
+        &self.store
+    }
+
+    /// Flushes the store to disk and discards log records it no longer needs.
+    ///
+    /// Returns the number of segments removed.
+    ///
+    /// The work runs on the writer thread, so it cannot overlap a batch being flushed.
+    /// Every write that reached the queue before this call is included.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be flushed or a segment cannot be
+    /// removed. Nothing is discarded unless the flush succeeded first.
+    pub async fn checkpoint(&mut self) -> Result<usize, Error> {
+        self.writer.checkpoint().await
+    }
+
+    /// Stops accepting writes and finishes those already queued.
+    pub fn shutdown(&mut self) {
+        self.writer.shutdown();
+    }
+}
+
+/// Where the log ends, once every complete record has been replayed.
+struct Recovered {
+    tail: Option<Tail>,
+}
+
+/// The segment new records append to, and the point they append at.
+struct Tail {
+    path: PathBuf,
+    /// Bytes holding complete records. Anything past this is a partial write.
+    valid: u64,
+}
+
+/// Replays records the store has not applied and locates the end of the log.
+fn recover<E: StorageEngine>(dir: &Path, store: &KvStore<E>) -> Result<Recovered, Error> {
+    let mut seen = 0_u64;
+    let mut pending = Vec::new();
+    let mut tail = None;
+
+    let segments = segment::list(dir)?;
+    let last = segments.len().saturating_sub(1);
+
+    for (index, (first, path)) in segments.into_iter().enumerate() {
+        let bytes = segment::read(&path)?;
+        let mut rest = bytes.as_slice();
+        let mut valid = 0_u64;
+
+        seen = first;
+
+        while !rest.is_empty() {
+            match record::decode(rest) {
+                Ok((mutation, width)) => {
+                    seen += 1;
+                    if seen > store.applied() {
+                        pending.push(mutation);
+                    }
+                    valid += width as u64;
+                    rest = &rest[width..];
+                }
+
+                // A record that ends early was left mid-append.
+                // In the last segment that is an interrupted write.
+                // It was never acknowledged, so no client is waiting on it,
+                // and recovery treats it as the end of the log.
+                Err(error) if error.is_truncated() && index == last => break,
+
+                // Anywhere earlier it is damage.
+                // A sealed segment always ends on a complete record, because rollover happens
+                // at a batch boundary after a successful append.
+                // A short one means records are missing between here and the next segment,
+                // and continuing would replay across the hole while reporting success.
+                Err(error) if error.is_truncated() => {
+                    return Err(Error::corrupt("a sealed segment ends mid-record"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        tail = Some(Tail { path, valid });
+    }
+
+    if seen < store.applied() {
+        return Err(Error::corrupt(
+            "log holds fewer records than the store has applied",
+        ));
+    }
+
+    if !pending.is_empty() {
+        store
+            .apply(&pending, seen)
+            .map_err(|e| Error::apply(e.to_string()))?;
+    }
+
+    Ok(Recovered { tail })
+}
+
+/// Flushes the store and removes the segments it has made redundant.
+///
+/// A segment is removed only when the segment after it begins at or below the
+/// checkpoint, which means every record it holds is already durable in the store.
+///
+///The active segment has no successor, so it is never a candidate.
+pub(crate) fn compact<E: StorageEngine>(store: &KvStore<E>, dir: &Path) -> Result<usize, Error> {
+    let durable = store
+        .checkpoint()
+        .map_err(|e| Error::apply(e.to_string()))?;
+
+    let segments = segment::list(dir)?;
+    let mut removed = 0;
+
+    for pair in segments.windows(2) {
+        let [(_, path), (next_first, _)] = pair else {
+            continue;
+        };
+        if *next_first > durable {
+            break;
+        }
+        segment::remove(path)?;
+        removed += 1;
+    }
+
+    Ok(removed)
+}

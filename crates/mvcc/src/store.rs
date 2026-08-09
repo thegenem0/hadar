@@ -2,7 +2,7 @@ use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use storage_api::{Bounds, ReadTxn, StorageEngine, WriteTxn};
 
-use crate::{error::Error, index::Index, record, revision::Revision};
+use crate::{error::Error, index::Index, meta, mutation::Mutation, record, revision::Revision};
 
 /// Records read per page when rebuilding the index at startup.
 const SCAN_PAGE: usize = 1024;
@@ -53,6 +53,7 @@ struct State {
     index: Index,
     current: Revision,
     compacted: u64,
+    applied: u64,
 }
 
 impl<E: StorageEngine> KvStore<E> {
@@ -67,6 +68,13 @@ impl<E: StorageEngine> KvStore<E> {
         let mut current = Revision::zero();
 
         let txn = engine.begin_read().map_err(Error::storage)?;
+
+        let applied = match txn.get(&meta::APPLIED_KEY).map_err(Error::storage)? {
+            Some(raw) => meta::decode_position(&raw)
+                .ok_or_else(|| Error::corrupt("applied-position marker is malformed"))?,
+            None => 0,
+        };
+
         let mut bounds = record::all_records();
 
         // A store's whole history can be far larger than memory,
@@ -103,6 +111,7 @@ impl<E: StorageEngine> KvStore<E> {
                 index,
                 current,
                 compacted: 0,
+                applied,
             }),
         })
     }
@@ -113,73 +122,94 @@ impl<E: StorageEngine> KvStore<E> {
         self.read_state().current
     }
 
-    /// Writes `value` under `key`, returning the revision it was written at.
+    /// Returns how far the caller's log has been applied to this store.
     ///
-    /// # Errors
-    ///
-    /// Returns an error if the backend write fails, in which case the store's
-    /// revision does not advance.
-    pub fn put(&self, key: &[u8], value: &[u8]) -> Result<Revision, Error> {
-        let mut state = self.write_state();
-        let revision = state.current.next_main();
-
-        let mut txn = self.engine.begin_write().map_err(Error::storage)?;
-        txn.insert(
-            &record::backend_key(revision, false),
-            &record::encode(key, value),
-        )
-        .map_err(Error::storage)?;
-        txn.commit().map_err(Error::storage)?;
-
-        // Applied only after the backend commit, so a failed write
-        // leaves the index true to what is on disk.
-        state.index.put(key, revision);
-        state.current = revision;
-
-        Ok(revision)
+    /// It is written in the same transaction as the accompanyin data,
+    /// ensuring a crash loses both or neither.
+    #[must_use]
+    pub fn applied(&self) -> u64 {
+        self.read_state().applied
     }
 
-    /// Deletes every key within `bounds`, returning the revision and the count.
+    /// Forces everything applied so far onto stable storage.
     ///
-    /// Deleting nothing does not advance the revision.
+    /// Ordinary commits are deliberately not durable — the log above provides
+    /// durability far more cheaply by batching. That leaves the backend free to
+    /// lag arbitrarily far behind, which is fine while the log still holds
+    /// everything needed to catch it up, and not fine once the log wants to
+    /// discard records.
+    ///
+    /// Returns the applied position now guaranteed to survive a crash.
     ///
     /// # Errors
     ///
-    /// Returns an error if the backend write fails, in which case nothing is deleted.
-    pub fn delete_range(&self, bounds: &Bounds) -> Result<(Revision, u64), Error> {
-        let mut state = self.write_state();
-        let revision = state.current.next_main();
-
-        let victims: Vec<Vec<u8>> = state
-            .index
-            .range(bounds, state.current.main())
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-
-        if victims.is_empty() {
-            return Ok((state.current, 0));
-        }
+    /// Returns an error if the backend cannot flush, in which case nothing has
+    /// been made durable and no records may be discarded.
+    pub fn checkpoint(&self) -> Result<u64, Error> {
+        // Held for the whole flush so the position reported cannot be stale by
+        // the time it is used to decide what to discard.
+        let state = self.write_state();
 
         let mut txn = self.engine.begin_write().map_err(Error::storage)?;
-        for (offset, key) in victims.iter().enumerate() {
-            let at = Revision::new(revision.main(), offset as u64)
-                .ok_or_else(|| Error::corrupt("delete exceeded the addressable sub range"))?;
+        txn.insert(&meta::APPLIED_KEY, &meta::encode_position(state.applied))
+            .map_err(Error::storage)?;
 
-            txn.insert(&record::backend_key(at, true), &record::encode(key, &[]))
-                .map_err(Error::storage)?;
+        txn.commit_durable().map_err(Error::storage)?;
+
+        Ok(state.applied)
+    }
+
+    /// Applies `batch` as one backend transaction, recording `upto` with it.
+    ///
+    /// Each mutation takes its own revision in order, so batching changes
+    /// nothing a client can observe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend write fails, in which case none of the
+    /// batch is applied and the store's revision does not advance.
+    pub fn apply(&self, batch: &[Mutation], upto: u64) -> Result<Vec<Revision>, Error> {
+        let mut state = self.write_state();
+        let mut txn = self.engine.begin_write().map_err(Error::storage)?;
+
+        let mut revision = state.current;
+        let mut revisions = Vec::with_capacity(batch.len());
+
+        for mutation in batch {
+            revision = revision.next_main();
+            let tombstone = matches!(mutation, Mutation::Delete { .. });
+            let value = match mutation {
+                Mutation::Put { value, .. } => value.as_slice(),
+                Mutation::Delete { .. } => &[],
+            };
+
+            txn.insert(
+                &record::backend_key(revision, tombstone),
+                &record::encode(mutation.key(), value),
+            )
+            .map_err(Error::storage)?;
+            revisions.push(revision);
         }
+
+        txn.insert(&meta::APPLIED_KEY, &meta::encode_position(upto))
+            .map_err(Error::storage)?;
 
         txn.commit().map_err(Error::storage)?;
 
-        for (offset, key) in victims.iter().enumerate() {
-            if let Some(at) = Revision::new(revision.main(), offset as u64) {
-                state.index.tombstone(key, at);
+        // The index is updated only once the backend has accepted the batch,
+        // so a failed commit leaves it describing exactly what is stored.
+        for (mutation, revision) in batch.iter().zip(&revisions) {
+            match mutation {
+                Mutation::Put { key, .. } => state.index.put(key, *revision),
+                Mutation::Delete { key } => {
+                    state.index.tombstone(key, *revision);
+                }
             }
         }
         state.current = revision;
+        state.applied = upto;
 
-        Ok((revision, victims.len() as u64))
+        Ok(revisions)
     }
 
     /// Returns the keys within `bounds` as they were at revision `at`.

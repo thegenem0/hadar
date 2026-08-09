@@ -1,0 +1,30 @@
+[package]
+name = "wal"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[test]]
+name = "faults"
+required-features = ["test-util"]
+
+[dependencies]
+crc32fast = { workspace = true }
+mvcc = { workspace = true }
+storage-api = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["sync"] }
+tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+storage-api = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[features]
+test-util = []
+
+[lints]
+workspace = true

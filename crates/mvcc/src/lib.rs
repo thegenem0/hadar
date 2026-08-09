@@ -22,6 +22,8 @@
 //! engine that satisfies the contract.
 mod error;
 mod index;
+mod meta;
+mod mutation;
 mod record;
 mod revision;
 mod store;
@@ -31,6 +33,9 @@ pub use crate::error::Error;
 
 #[doc(inline)]
 pub use crate::index::Found;
+
+#[doc(inline)]
+pub use crate::mutation::Mutation;
 
 #[doc(inline)]
 pub use crate::revision::Revision;

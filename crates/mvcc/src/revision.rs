@@ -111,6 +111,19 @@ impl Revision {
 
         Self::new(main, sub)
     }
+
+    /// Returns the transaction revision in the wire's signed representation.
+    ///
+    /// Total by construction: [`new`](Self::new) refuses anything above
+    /// [`i64::MAX`], which is what makes this conversion lossless.
+    #[must_use]
+    #[expect(
+        clippy::cast_possible_wrap,
+        reason = "Revision::new rejects any value above i64::MAX"
+    )]
+    pub fn as_wire(self) -> i64 {
+        self.main as i64
+    }
 }
 
 #[cfg(test)]
