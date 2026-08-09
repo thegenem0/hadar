@@ -9,7 +9,7 @@ pub struct Error {
     source: Option<std::io::Error>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Kind {
     Shutdown,
     Apply(Cow<'static, str>),
@@ -44,9 +44,9 @@ impl Error {
     }
 
     /// Reports a write that failed because its batch did.
-    pub(crate) fn batch_failed(detail: &str) -> Self {
+    pub(crate) fn batch_failed(&self) -> Self {
         Self {
-            kind: Kind::Apply(Cow::Owned(detail.to_owned())),
+            kind: self.kind.clone(),
             source: None,
         }
     }

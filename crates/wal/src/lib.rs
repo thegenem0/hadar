@@ -33,6 +33,7 @@
 
 mod error;
 mod frame;
+mod io;
 mod record;
 mod segment;
 mod wal;
@@ -43,3 +44,7 @@ pub use crate::error::Error;
 
 #[doc(inline)]
 pub use crate::wal::{Options, Wal};
+
+#[cfg(feature = "test-util")]
+#[doc(inline)]
+pub use crate::io::Faults;

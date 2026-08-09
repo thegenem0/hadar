@@ -191,7 +191,8 @@ fn retire<E: StorageEngine>(
     // Roll over first, so a batch is never split across two segments and
     // recovery never has to stitch one back together.
     if segment.is_full() {
-        *segment = Segment::create(dir, store.applied(), segment.limit())?;
+        let next = segment.roll_over(dir, store.applied())?;
+        *segment = next;
     }
     segment.append(&bytes)?;
     *appended += bytes.len() as u64;
@@ -217,9 +218,8 @@ fn answer(batch: &mut Vec<Request>, outcome: Result<Vec<Revision>, Error>) {
             }
         }
         Err(error) => {
-            let message = error.to_string();
             for request in batch.drain(..) {
-                drop(request.respond.send(Err(Error::batch_failed(&message))));
+                drop(request.respond.send(Err(error.batch_failed())));
             }
         }
     }

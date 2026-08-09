@@ -255,3 +255,32 @@ async fn records_survive_the_log_checkpointing_itself() {
     assert_eq!(store.current_revision().main(), 200);
     assert_eq!(values(&store).len(), 200);
 }
+
+#[tokio::test]
+async fn a_hole_in_a_sealed_segment_is_refused() {
+    let dir = LogDir::new();
+    let options = tiny();
+
+    {
+        let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
+        let log = Wal::with_options(dir.path(), store, options).expect("log opens");
+        fill(&log, 20).await;
+    }
+
+    // Chop the tail off a segment that is not the last one. Rollover happens
+    // only at a batch boundary, so a sealed segment ending mid-record can only
+    // mean records went missing between it and the segment after it.
+    let names = segments(dir.path());
+    let sealed = dir.path().join(names.first().expect("a segment existed"));
+    let bytes = std::fs::read(&sealed).expect("segment is readable");
+    std::fs::write(&sealed, &bytes[..bytes.len() - 5]).expect("segment is writable");
+
+    let store = Arc::new(KvStore::open(MemEngine::new()).expect("store opens"));
+    let error = Wal::with_options(dir.path(), store, options)
+        .expect_err("a hole in the middle of the log was accepted");
+
+    assert!(
+        error.is_corrupt(),
+        "reported {error} rather than corruption"
+    );
+}

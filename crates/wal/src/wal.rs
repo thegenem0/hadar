@@ -6,7 +6,7 @@ use std::{
 use mvcc::{KvStore, Mutation, Revision};
 use storage_api::StorageEngine;
 
-use crate::{error::Error, record, segment, writer::Writer};
+use crate::{error::Error, io::Media, record, segment, writer::Writer};
 
 /// Bytes appended between automatic checkpoints.
 ///
@@ -92,13 +92,39 @@ impl<E: StorageEngine> Wal<E> {
         store: Arc<KvStore<E>>,
         options: Options,
     ) -> Result<Self, Error> {
+        Self::open_with(dir, store, options, &Media::Real)
+    }
+
+    /// Opens the log with faults injected into its I/O.
+    ///
+    /// # Errors
+    ///
+    /// As [`open`](Self::open).
+    #[cfg(feature = "test-util")]
+    pub fn with_faults(
+        dir: impl Into<PathBuf>,
+        store: Arc<KvStore<E>>,
+        options: Options,
+        faults: Arc<crate::Faults>,
+    ) -> Result<Self, Error> {
+        Self::open_with(dir, store, options, &Media::Faulty(faults))
+    }
+
+    fn open_with(
+        dir: impl Into<PathBuf>,
+        store: Arc<KvStore<E>>,
+        options: Options,
+        media: &Media,
+    ) -> Result<Self, Error> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir).map_err(|e| Error::io("creating the log directory", e))?;
 
         let recovered = recover(&dir, &store)?;
         let segment = match recovered.tail {
-            Some(tail) => segment::Segment::reopen(&tail.path, tail.valid, options.segment_limit)?,
-            None => segment::Segment::create(&dir, 0, options.segment_limit)?,
+            Some(tail) => {
+                segment::Segment::reopen(media, &tail.path, tail.valid, options.segment_limit)?
+            }
+            None => segment::Segment::create(media, &dir, 0, options.segment_limit)?,
         };
 
         Ok(Self {
@@ -173,7 +199,10 @@ fn recover<E: StorageEngine>(dir: &Path, store: &KvStore<E>) -> Result<Recovered
     let mut pending = Vec::new();
     let mut tail = None;
 
-    for (first, path) in segment::list(dir)? {
+    let segments = segment::list(dir)?;
+    let last = segments.len().saturating_sub(1);
+
+    for (index, (first, path)) in segments.into_iter().enumerate() {
         let bytes = segment::read(&path)?;
         let mut rest = bytes.as_slice();
         let mut valid = 0_u64;
@@ -192,14 +221,30 @@ fn recover<E: StorageEngine>(dir: &Path, store: &KvStore<E>) -> Result<Recovered
                 }
 
                 // A record that ends early was left mid-append.
-                // It was never acknowledged, so no client is waiting on it and
-                // it is discarded rather than replayed.
-                Err(error) if error.is_truncated() => break,
+                // In the last segment that is an interrupted write.
+                // It was never acknowledged, so no client is waiting on it,
+                // and recovery treats it as the end of the log.
+                Err(error) if error.is_truncated() && index == last => break,
+
+                // Anywhere earlier it is damage.
+                // A sealed segment always ends on a complete record, because rollover happens
+                // at a batch boundary after a successful append.
+                // A short one means records are missing between here and the next segment,
+                // and continuing would replay across the hole while reporting success.
+                Err(error) if error.is_truncated() => {
+                    return Err(Error::corrupt("a sealed segment ends mid-record"));
+                }
                 Err(error) => return Err(error),
             }
         }
 
         tail = Some(Tail { path, valid });
+    }
+
+    if seen < store.applied() {
+        return Err(Error::corrupt(
+            "log holds fewer records than the store has applied",
+        ));
     }
 
     if !pending.is_empty() {
