@@ -9,8 +9,10 @@ repository = "https://github.com/thegenem0/hadar"
 license = "Apache-2.0"
 
 [workspace.dependencies]
+anyhow = { version = "1.0" }
 api = { path = "crates/api", version = "0.1.0" }
-crc32fast = { version = "1.5.0" }
+crc32fast = { version = "1.5" }
+hadar = { path = "crates/hadar", version = "0.1.0" }
 mvcc = { path = "crates/mvcc", version = "0.1.0" }
 proptest = { version = "1.5.0" }
 prost = {
@@ -24,7 +26,7 @@ storage-api = { path = "crates/storage-api", version = "0.1.0" }
 storage-redb = { path = "crates/storage-redb", version = "0.1.0" }
 tempfile = { version = "3.27.0" }
 thiserror = { version = "2", default-features = false, features = ["std"] }
-tokio = { version = "1.53.1", features = ["default"] }
+tokio = { version = "1.53", features = ["default"] }
 tonic = {
   version = "0.14",
   default-features = false,
@@ -36,6 +38,11 @@ tracing = {
   version = "0.1",
   default-features = false,
   features = ["attributes", "std"]
+}
+tracing-subscriber = {
+  version = "0.3",
+  default-features = false,
+  features = ["ansi", "env-filter", "fmt", "std"]
 }
 wal = { path = "crates/wal", version = "0.1.0" }
 

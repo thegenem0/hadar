@@ -13,15 +13,16 @@ const EXTENSION: &str = "wal";
 ///
 /// Compaction discards whole segments, so this sets the granularity of reclamation.
 /// No space is freed until every record in a segment is below the snapshot point.
-const SEGMENT_LIMIT: u64 = 64 * 1024 * 1024;
+pub(crate) const SEGMENT_LIMIT: u64 = 64 * 1024 * 1024;
 
 /// The append target for new records.
 #[derive(Debug)]
 pub(crate) struct Segment {
     file: File,
-    /// Index of the first record this segment holds.
-    first: u64,
+    /// Bytes written to this segment so far.
     written: u64,
+    /// Size at which this segment is considered full.
+    limit: u64,
 }
 
 impl Segment {
@@ -30,7 +31,7 @@ impl Segment {
     /// # Errors
     ///
     /// Returns an error if the file cannot be created.
-    pub(crate) fn create(dir: &Path, first: u64) -> Result<Self, Error> {
+    pub(crate) fn create(dir: &Path, first: u64, limit: u64) -> Result<Self, Error> {
         let path = dir.join(format!("{first:020}.{EXTENSION}"));
         let file = OpenOptions::new()
             .create_new(true)
@@ -40,8 +41,8 @@ impl Segment {
 
         Ok(Self {
             file,
-            first,
             written: 0,
+            limit,
         })
     }
 
@@ -55,7 +56,7 @@ impl Segment {
     /// # Errors
     ///
     /// Returns an error if the file cannot be opened or truncated.
-    pub(crate) fn reopen(path: &Path, first: u64, valid: u64) -> Result<Self, Error> {
+    pub(crate) fn reopen(path: &Path, valid: u64, limit: u64) -> Result<Self, Error> {
         let file = OpenOptions::new()
             .append(true)
             .open(path)
@@ -69,8 +70,8 @@ impl Segment {
 
         Ok(Self {
             file,
-            first,
             written: valid,
+            limit,
         })
     }
 
@@ -92,17 +93,18 @@ impl Segment {
             .sync_data()
             .map_err(|e| Error::io("flushing a segment to disk", e))?;
 
+        self.written += bytes.len() as u64;
         Ok(())
     }
 
     /// Returns whether this segment has reached the size at which to roll over.
     pub(crate) fn is_full(&self) -> bool {
-        self.written >= SEGMENT_LIMIT
+        self.written >= self.limit
     }
 
-    /// Returns the index of the first record this segment holds.
-    pub(crate) fn first(&self) -> u64 {
-        self.first
+    /// Returns the size at which this segment rolls over.
+    pub(crate) fn limit(&self) -> u64 {
+        self.limit
     }
 }
 
@@ -151,4 +153,13 @@ pub(crate) fn read(path: &Path) -> Result<Vec<u8>, Error> {
         .map_err(|e| Error::io("reading a segment", e))?;
 
     Ok(bytes)
+}
+
+/// Deletes `path`.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be removed.
+pub(crate) fn remove(path: &Path) -> Result<(), Error> {
+    std::fs::remove_file(path).map_err(|e| Error::io("removing a compacted segment", e))
 }

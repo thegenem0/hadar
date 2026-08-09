@@ -215,6 +215,18 @@ impl WriteTxn for RedbWrite {
             .map_err(|e| error::commit("committing write", e))
     }
 
+    fn commit_durable(mut self) -> Result<(), Error> {
+        // Overrides the relaxed default set when the transaction was opened.
+        // redb flushes as part of an immediate commit, so no separate sync is needed.
+        self.txn
+            .set_durability(Durability::Immediate)
+            .map_err(|e| error::durability("requesting a durable commit", e))?;
+
+        self.txn
+            .commit()
+            .map_err(|e| error::commit("committing write durably", e))
+    }
+
     fn abort(self) -> Result<(), Error> {
         self.txn
             .abort()

@@ -23,6 +23,9 @@ pub mod pb {
     #![allow(
         missing_docs,
         unused_qualifications,
+        clippy::allow_attributes,
+        clippy::allow_attributes_without_reason,
+        clippy::clone_on_ref_ptr,
         clippy::default_trait_access,
         clippy::doc_markdown,
         clippy::must_use_candidate,

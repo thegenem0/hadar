@@ -14,7 +14,7 @@ pub struct Error {
     kind: Kind,
     context: Cow<'static, str>,
     #[source]
-    source: Option<Box<dyn StdError>>,
+    source: Option<Box<dyn StdError + Send + Sync + 'static>>,
 }
 
 /// Classification of a storage failure.

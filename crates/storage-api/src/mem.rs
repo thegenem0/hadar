@@ -114,6 +114,11 @@ impl WriteTxn for MemWrite {
         Ok(())
     }
 
+    /// Commits, since an in-memory keyspace has no stable storage to reach.
+    fn commit_durable(self) -> Result<(), Error> {
+        self.commit()
+    }
+
     fn abort(mut self) -> Result<(), Error> {
         self.finish();
         Ok(())

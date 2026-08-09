@@ -42,4 +42,4 @@ mod writer;
 pub use crate::error::Error;
 
 #[doc(inline)]
-pub use crate::wal::Wal;
+pub use crate::wal::{Options, Wal};

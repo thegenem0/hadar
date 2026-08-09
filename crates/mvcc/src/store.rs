@@ -131,6 +131,34 @@ impl<E: StorageEngine> KvStore<E> {
         self.read_state().applied
     }
 
+    /// Forces everything applied so far onto stable storage.
+    ///
+    /// Ordinary commits are deliberately not durable — the log above provides
+    /// durability far more cheaply by batching. That leaves the backend free to
+    /// lag arbitrarily far behind, which is fine while the log still holds
+    /// everything needed to catch it up, and not fine once the log wants to
+    /// discard records.
+    ///
+    /// Returns the applied position now guaranteed to survive a crash.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the backend cannot flush, in which case nothing has
+    /// been made durable and no records may be discarded.
+    pub fn checkpoint(&self) -> Result<u64, Error> {
+        // Held for the whole flush so the position reported cannot be stale by
+        // the time it is used to decide what to discard.
+        let state = self.write_state();
+
+        let mut txn = self.engine.begin_write().map_err(Error::storage)?;
+        txn.insert(&meta::APPLIED_KEY, &meta::encode_position(state.applied))
+            .map_err(Error::storage)?;
+
+        txn.commit_durable().map_err(Error::storage)?;
+
+        Ok(state.applied)
+    }
+
     /// Applies `batch` as one backend transaction, recording `upto` with it.
     ///
     /// Each mutation takes its own revision in order, so batching changes

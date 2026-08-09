@@ -1,20 +1,21 @@
 [package]
-name = "wal"
+name = "hadar"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-crc32fast = { workspace = true }
+anyhow = { workspace = true }
 mvcc = { workspace = true }
 storage-api = { workspace = true }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync"] }
+storage-redb = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+wal = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
-storage-api = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 

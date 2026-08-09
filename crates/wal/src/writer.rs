@@ -86,7 +86,7 @@ impl Writer {
         drop(std::mem::replace(&mut self.submit, idle));
 
         if let Some(thread) = self.thread.take() {
-            drop(thread.join())
+            drop(thread.join());
         }
     }
 }
@@ -143,8 +143,7 @@ fn retire<E: StorageEngine>(
     // Roll over first, so a batch is never split across two segments and
     // recovery never has to stitch one back together.
     if segment.is_full() {
-        let next = segment.first() + mutations.len() as u64;
-        *segment = Segment::create(dir, next)?;
+        *segment = Segment::create(dir, store.applied(), segment.limit())?;
     }
     segment.append(&bytes)?;
 
@@ -171,7 +170,7 @@ fn answer(batch: &mut Vec<Request>, outcome: Result<Vec<Revision>, Error>) {
         Err(error) => {
             let message = error.to_string();
             for request in batch.drain(..) {
-                drop(request.respond.send(Err(Error::batch_failed(&message))))
+                drop(request.respond.send(Err(Error::batch_failed(&message))));
             }
         }
     }
