@@ -7,10 +7,16 @@ license.workspace = true
 
 [dependencies]
 crc32fast = { workspace = true }
+mvcc = { workspace = true }
+storage-api = { workspace = true }
 thiserror = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+storage-api = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]
 workspace = true

@@ -17,6 +17,7 @@ pub enum Mutation {
         /// Value to store.
         value: Vec<u8>,
     },
+    /// Removes a single key.
     Delete {
         /// Key to remove.
         key: Vec<u8>,

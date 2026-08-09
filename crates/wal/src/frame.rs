@@ -70,3 +70,144 @@ fn checksum(len: [u8; 4], payload: &[u8]) -> u32 {
     hasher.update(payload);
     hasher.finalize()
 }
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "test assertions surface failures by panicking"
+)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::{HEADER_LEN, decode, encode};
+
+    fn framed(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode(payload, &mut out).expect("payload is within the frame limit");
+        out
+    }
+
+    #[test]
+    fn a_frame_round_trips() {
+        let bytes = framed(b"payload");
+        let (payload, width) = decode(&bytes).expect("frame decodes");
+
+        assert_eq!(payload, b"payload");
+        assert_eq!(width, bytes.len());
+    }
+
+    #[test]
+    fn an_empty_payload_is_a_valid_frame() {
+        let bytes = framed(b"");
+        let (payload, width) = decode(&bytes).expect("frame decodes");
+
+        assert!(payload.is_empty());
+        assert_eq!(width, HEADER_LEN);
+    }
+
+    #[test]
+    fn frames_decode_back_to_back() {
+        let mut log = framed(b"first");
+        log.extend_from_slice(&framed(b"second"));
+
+        let (first, width) = decode(&log).expect("first frame decodes");
+        assert_eq!(first, b"first");
+        let (second, _) = decode(&log[width..]).expect("second frame decodes");
+        assert_eq!(second, b"second");
+    }
+
+    #[test]
+    fn a_frame_cut_short_reads_as_truncated() {
+        let bytes = framed(b"payload");
+
+        // Every prefix is a write that was interrupted partway, which is what
+        // a kill mid-append leaves behind.
+        for cut in 0..bytes.len() {
+            let error = decode(&bytes[..cut]).expect_err("a partial frame cannot decode");
+            assert!(
+                error.is_truncated(),
+                "a {cut}-byte prefix reported {error} rather than truncation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_corrupted_payload_fails_its_checksum() {
+        let mut bytes = framed(b"payload");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+
+        let error = decode(&bytes).expect_err("a damaged payload cannot decode");
+        assert!(
+            error.is_corrupt(),
+            "reported {error} rather than corruption"
+        );
+    }
+
+    #[test]
+    fn a_corrupted_length_is_caught_by_the_checksum() {
+        let mut bytes = framed(b"payload");
+        // Shrink the claimed length so the frame still fits in the buffer: the
+        // read would otherwise succeed and reframe everything after it.
+        bytes[7] -= 1;
+
+        let error = decode(&bytes).expect_err("a damaged length cannot decode");
+        assert!(
+            error.is_corrupt(),
+            "reported {error} rather than corruption"
+        );
+    }
+
+    #[test]
+    fn an_implausible_length_is_rejected_before_allocating() {
+        let mut bytes = framed(b"payload");
+        bytes[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+
+        let error = decode(&bytes).expect_err("an implausible length cannot decode");
+        assert!(
+            error.is_corrupt(),
+            "reported {error} rather than corruption"
+        );
+    }
+
+    proptest! {
+        #[test]
+        fn any_payload_round_trips(payload in prop::collection::vec(any::<u8>(), 0..2048)) {
+            let bytes = framed(&payload);
+            let (decoded, width) = decode(&bytes).expect("frame decodes");
+
+            prop_assert_eq!(decoded, payload.as_slice());
+            prop_assert_eq!(width, bytes.len());
+        }
+
+        #[test]
+        fn any_truncation_is_reported_as_truncation(
+            payload in prop::collection::vec(any::<u8>(), 0..512),
+            cut in 0_usize..512,
+        ) {
+            let bytes = framed(&payload);
+            let cut = cut % bytes.len().max(1);
+
+            let error = decode(&bytes[..cut]).expect_err("a partial frame cannot decode");
+            prop_assert!(error.is_truncated(), "reported {} rather than truncation", error);
+        }
+
+        #[test]
+        fn any_single_bit_flip_is_caught(
+            payload in prop::collection::vec(any::<u8>(), 1..512),
+            index in any::<prop::sample::Index>(),
+            bit in 0_u32..8,
+        ) {
+            let mut bytes = framed(&payload);
+            let position = index.index(bytes.len());
+            bytes[position] ^= 1 << bit;
+
+            // A flip anywhere in the frame must be caught.
+            let error = decode(&bytes).expect_err("a damaged frame cannot decode");
+            prop_assert!(
+                error.is_corrupt() || error.is_truncated(),
+                "reported {}", error
+            );
+        }
+    }
+}

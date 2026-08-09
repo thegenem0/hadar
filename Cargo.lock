@@ -1255,8 +1255,12 @@ name = "wal"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
+ "mvcc",
  "proptest",
+ "storage-api",
+ "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]

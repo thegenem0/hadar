@@ -22,6 +22,7 @@ protox = { version = "0.9" }
 redb = { version = "4" }
 storage-api = { path = "crates/storage-api", version = "0.1.0" }
 storage-redb = { path = "crates/storage-redb", version = "0.1.0" }
+tempfile = { version = "3.27.0" }
 thiserror = { version = "2", default-features = false, features = ["std"] }
 tokio = { version = "1.53.1", features = ["default"] }
 tonic = {
