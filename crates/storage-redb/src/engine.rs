@@ -1,8 +1,8 @@
 use std::{fmt, ops::RangeBounds, path::Path};
 
 use redb::{
-    Database, ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
-    WriteTransaction,
+    Database, Durability, ReadOnlyTable, ReadTransaction, ReadableDatabase, ReadableTable,
+    TableDefinition, WriteTransaction,
 };
 use storage_api::{Bounds, Error, Pair, ReadTxn, StorageEngine, WriteTxn};
 
@@ -127,10 +127,17 @@ impl StorageEngine for RedbEngine {
     }
 
     fn begin_write(&self) -> Result<Self::WriteTxn, Error> {
-        let txn = self
+        let mut txn = self
             .db
             .begin_write()
             .map_err(|e| error::transaction("beginning write", e))?;
+
+        // The contract promises atomicity and visibility ordering, not
+        // durability. That is the responsibility of the WAL.
+        // Redb's durability would be extra overhead,
+        // that provides no benefit in this case.
+        txn.set_durability(Durability::None)
+            .map_err(|e| error::durability("relaxing commit durability", e))?;
 
         Ok(RedbWrite { txn })
     }

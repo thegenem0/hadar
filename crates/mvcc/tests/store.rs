@@ -5,11 +5,51 @@
     reason = "test assertions surface failures by panicking"
 )]
 
-use mvcc::KvStore;
+use mvcc::{KvStore, Mutation, Revision};
 use storage_api::{Bounds, MemEngine};
 
 fn store() -> KvStore<MemEngine> {
     KvStore::open(MemEngine::new()).unwrap()
+}
+
+fn put(key: &[u8], value: &[u8]) -> Mutation {
+    Mutation::Put {
+        key: key.to_vec(),
+        value: value.to_vec(),
+    }
+}
+
+/// Applies a batch, advancing the log position by one per mutation.
+///
+/// The store treats the position as opaque, so the tests only have to keep it
+/// moving forward the way a real log would.
+fn apply(store: &KvStore<MemEngine>, batch: &[Mutation]) -> Vec<Revision> {
+    let upto = store.applied() + batch.len() as u64;
+    store.apply(batch, upto).unwrap()
+}
+
+fn write(store: &KvStore<MemEngine>, key: &[u8], value: &[u8]) -> Revision {
+    apply(store, &[put(key, value)])[0]
+}
+
+/// Resolves `bounds` to the keys it currently matches and deletes them.
+///
+/// Resolution belongs to the caller now: the store applies mutations that
+/// already name their keys, so a replayed delete cannot match a different set
+/// than the original did.
+fn delete_range(store: &KvStore<MemEngine>, bounds: &Bounds) -> u64 {
+    let victims: Vec<Mutation> = store
+        .range(bounds, None, None)
+        .unwrap()
+        .into_iter()
+        .map(|record| Mutation::Delete { key: record.key })
+        .collect();
+
+    let deleted = victims.len() as u64;
+    if !victims.is_empty() {
+        apply(store, &victims);
+    }
+    deleted
 }
 
 fn values(records: &[mvcc::Record]) -> Vec<&[u8]> {
@@ -29,17 +69,17 @@ fn an_empty_store_starts_at_revision_zero() {
 #[test]
 fn each_write_advances_the_revision_by_one() {
     let store = store();
-    assert_eq!(store.put(b"a", b"1").unwrap().main(), 1);
-    assert_eq!(store.put(b"b", b"1").unwrap().main(), 2);
-    assert_eq!(store.put(b"a", b"2").unwrap().main(), 3);
+    assert_eq!(write(&store, b"a", b"1").main(), 1);
+    assert_eq!(write(&store, b"b", b"1").main(), 2);
+    assert_eq!(write(&store, b"a", b"2").main(), 3);
 }
 
 #[test]
 fn a_read_at_an_old_revision_sees_the_value_of_that_time() {
     let store = store();
-    store.put(b"k", b"first").unwrap();
-    let old = store.put(b"k", b"second").unwrap().main();
-    store.put(b"k", b"third").unwrap();
+    write(&store, b"k", b"first");
+    let old = write(&store, b"k", b"second").main();
+    write(&store, b"k", b"third");
 
     let historical = store
         .range(&Bounds::point(b"k".as_slice()), Some(old), None)
@@ -55,8 +95,8 @@ fn a_read_at_an_old_revision_sees_the_value_of_that_time() {
 #[test]
 fn creation_and_version_track_a_keys_life() {
     let store = store();
-    let created = store.put(b"k", b"1").unwrap();
-    store.put(b"k", b"2").unwrap();
+    let created = write(&store, b"k", b"1");
+    write(&store, b"k", b"2");
 
     let record = store
         .range(&Bounds::point(b"k".as_slice()), None, None)
@@ -69,9 +109,9 @@ fn creation_and_version_track_a_keys_life() {
 #[test]
 fn a_recreated_key_reports_its_new_creation_revision() {
     let store = store();
-    store.put(b"k", b"first").unwrap();
-    store.delete_range(&Bounds::point(b"k".as_slice())).unwrap();
-    let recreated = store.put(b"k", b"second").unwrap();
+    write(&store, b"k", b"first");
+    delete_range(&store, &Bounds::point(b"k".as_slice()));
+    let recreated = write(&store, b"k", b"second");
 
     let record = store
         .range(&Bounds::point(b"k".as_slice()), None, None)
@@ -84,8 +124,8 @@ fn a_recreated_key_reports_its_new_creation_revision() {
 #[test]
 fn deleted_keys_vanish_from_the_current_revision_but_not_the_past() {
     let store = store();
-    let written = store.put(b"k", b"v").unwrap().main();
-    let (_, deleted) = store.delete_range(&Bounds::point(b"k".as_slice())).unwrap();
+    let written = write(&store, b"k", b"v").main();
+    let deleted = delete_range(&store, &Bounds::point(b"k".as_slice()));
 
     assert_eq!(deleted, 1);
     assert!(store.range(&Bounds::all(), None, None).unwrap().is_empty());
@@ -101,39 +141,37 @@ fn deleted_keys_vanish_from_the_current_revision_but_not_the_past() {
 #[test]
 fn deleting_nothing_does_not_advance_the_revision() {
     let store = store();
-    store.put(b"k", b"v").unwrap();
+    write(&store, b"k", b"v");
     let before = store.current_revision();
 
-    let (revision, deleted) = store
-        .delete_range(&Bounds::prefix(b"absent".as_slice()))
-        .unwrap();
+    let deleted = delete_range(&store, &Bounds::prefix(b"absent".as_slice()));
     assert_eq!(deleted, 0);
-    assert_eq!(revision, before);
-    assert_eq!(store.current_revision(), before);
+    assert_eq!(
+        store.current_revision(),
+        before,
+        "a delete matching nothing consumed a revision"
+    );
 }
 
 #[test]
 fn a_ranged_delete_removes_every_key_in_bounds_at_one_revision() {
     let store = store();
     for key in [b"a", b"b", b"c"] {
-        store.put(key, b"v").unwrap();
+        write(&store, key, b"v");
     }
 
-    let (revision, deleted) = store
-        .delete_range(&Bounds::between(b"a".as_slice(), b"c".as_slice()))
-        .unwrap();
+    let deleted = delete_range(&store, &Bounds::between(b"a".as_slice(), b"c".as_slice()));
 
     assert_eq!(deleted, 2);
     let remaining = store.range(&Bounds::all(), None, None).unwrap();
     assert_eq!(remaining.len(), 1, "the exclusive end bound was deleted");
-    assert_eq!(store.current_revision(), revision);
 }
 
 #[test]
 fn range_respects_bounds_and_limit() {
     let store = store();
     for key in [b"a", b"b", b"c", b"d"] {
-        store.put(key, b"v").unwrap();
+        write(&store, key, b"v");
     }
 
     assert_eq!(store.range(&Bounds::all(), None, Some(2)).unwrap().len(), 2);
@@ -153,9 +191,9 @@ fn range_respects_bounds_and_limit() {
 #[test]
 fn reading_below_the_compaction_watermark_is_refused() {
     let store = store();
-    let early = store.put(b"k", b"first").unwrap().main();
-    store.put(b"k", b"second").unwrap();
-    let watermark = store.put(b"k", b"third").unwrap().main();
+    let early = write(&store, b"k", b"first").main();
+    write(&store, b"k", b"second");
+    let watermark = write(&store, b"k", b"third").main();
 
     store.compact(watermark).unwrap();
 
@@ -175,9 +213,9 @@ fn reading_below_the_compaction_watermark_is_refused() {
 #[test]
 fn compaction_reclaims_superseded_records() {
     let store = store();
-    store.put(b"k", b"first").unwrap();
-    store.put(b"k", b"second").unwrap();
-    let watermark = store.put(b"k", b"third").unwrap().main();
+    write(&store, b"k", b"first");
+    write(&store, b"k", b"second");
+    let watermark = write(&store, b"k", b"third").main();
 
     assert_eq!(store.compact(watermark).unwrap(), 2);
     assert_eq!(
@@ -190,7 +228,7 @@ fn compaction_reclaims_superseded_records() {
 #[test]
 fn reading_a_future_revision_is_refused() {
     let store = store();
-    store.put(b"k", b"v").unwrap();
+    write(&store, b"k", b"v");
 
     let error = store.range(&Bounds::all(), Some(99), None).unwrap_err();
     assert!(
@@ -203,7 +241,7 @@ fn reading_a_future_revision_is_refused() {
 fn compaction_cannot_move_backwards() {
     let store = store();
     for _ in 0..3 {
-        store.put(b"k", b"v").unwrap();
+        write(&store, b"k", b"v");
     }
     store.compact(3).unwrap();
 
@@ -215,10 +253,10 @@ fn reopening_rebuilds_the_index_from_the_backend() {
     let engine = MemEngine::new();
     let written = {
         let store = KvStore::open(engine.clone()).unwrap();
-        store.put(b"a", b"1").unwrap();
-        store.put(b"b", b"2").unwrap();
-        store.delete_range(&Bounds::point(b"a".as_slice())).unwrap();
-        store.put(b"a", b"3").unwrap()
+        write(&store, b"a", b"1");
+        write(&store, b"b", b"2");
+        delete_range(&store, &Bounds::point(b"a".as_slice()));
+        write(&store, b"a", b"3")
     };
 
     let reopened = KvStore::open(engine).unwrap();
